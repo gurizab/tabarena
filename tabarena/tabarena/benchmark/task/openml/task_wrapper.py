@@ -52,7 +52,7 @@ class OpenMLTaskWrapper:
             return self._eval_metric
         metric_map = {
             "binary": "roc_auc",
-            "multiclass": "log_loss",
+            "multiclass": "roc_auc_ovo",
             # Same value/name used in ExperimentRunner.eval_metric_name
             #   - mostly for backwards compatibility
             "regression": "rmse",
