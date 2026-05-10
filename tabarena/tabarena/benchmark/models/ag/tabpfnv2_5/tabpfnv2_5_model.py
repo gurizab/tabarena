@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from autogluon.common.utils.resource_utils import ResourceManager
-from autogluon.core.models import AbstractModel
+from autogluon.common.utils.pandas_utils import get_approximate_df_mem_usage
+from autogluon.tabular.models.abstract.abstract_torch_model import AbstractTorchModel
 from autogluon.features.generators import LabelEncoderFeatureGenerator
 
 if TYPE_CHECKING:
@@ -17,7 +18,7 @@ logger = logging.getLogger(__name__)
 _HAS_LOGGED_TABPFN_LICENSE: bool = False
 
 
-class TabPFNModel(AbstractModel):
+class TabPFNModel(AbstractTorchModel):
     """TabPFN-2.5 is a tabular foundation model that is developed and maintained by PriorLabs: https://priorlabs.ai/.
 
     This class is an abstract template for various TabPFN versions as subclasses.
@@ -32,6 +33,9 @@ class TabPFNModel(AbstractModel):
     ag_name = "NOTSET"
     ag_priority = 105
     seed_name = "random_state"
+    fixed_random_state: int | None = None
+    """If not None, this fixes the random state to a static value to avoid that the
+    validation score is misleading for the refit model."""
 
     custom_model_dir: str | None = None
     default_classification_model: str | None = "NOTSET"
@@ -172,18 +176,47 @@ class TabPFNModel(AbstractModel):
             if k.startswith("finetuning_config/"):
                 del hps[k]
 
+        # Resolve many_class config
+        many_class_config = {
+            _k: v
+            for k, v in hps.items()
+            if k.startswith("many_class/") and (_k := k.split("/", 1)[1])
+        }
+        for k in list(hps.keys()):
+            if k.startswith("many_class/"):
+                del hps[k]
+
         use_finetuning = hps.pop("use_finetuning", False)
         if not use_finetuning:
             from tabpfn import TabPFNClassifier, TabPFNRegressor
 
+
+            if self.fixed_random_state is not None:
+                hps[self.seed_name] = self.fixed_random_state
+
             # Use ICL, fit preprocessing only
             model_base = TabPFNClassifier if is_classification else TabPFNRegressor
             self.model = model_base(**hps)
+
+            # Wrap with ManyClassClassifier for datasets with >10 classes
+            if is_classification and self.num_classes is not None and self.num_classes > 10:
+                from tabpfn_extensions.many_class import ManyClassClassifier
+
+                self.model = ManyClassClassifier(
+                    estimator=self.model,
+                    alphabet_size=10,
+                    random_state=hps.get(self.seed_name, 0),
+                    **many_class_config,
+                )
+
             self.model = self.model.fit(
                 X=X,
                 y=y,
             )
         else:
+            raise NotImplementedError(
+                "Finetuning is not supported anymore for now due to other changes!."
+            )
             # TODO:
             #   Future Work for better performance:
             #   - set n_finetune_ctx_plus_query_samples and finetune_ctx_query_split_ratio
@@ -260,20 +293,30 @@ class TabPFNModel(AbstractModel):
         for param, val in default_params.items():
             self._set_default_param_value(param, val)
 
+    def _get_base_tabpfn_model(self):
+        """Unwrap ManyClassClassifier to get the underlying TabPFN estimator."""
+        try:
+            from tabpfn_extensions.many_class import ManyClassClassifier
+        except ImportError:
+            return self.model
+        if isinstance(self.model, ManyClassClassifier):
+            return self.model.estimator
+        return self.model
+
+    def get_device(self) -> str:
+        base = self._get_base_tabpfn_model()
+        if hasattr(base, "devices_"):
+            return base.devices_[0].type
+        # When wrapped in ManyClassClassifier, the base estimator is not fitted
+        # and devices_ is not available. Fall back to the constructor device param.
+        return base.device
+
+    def _set_device(self, device: str):
+        self._get_base_tabpfn_model().to(device)
+
     @classmethod
     def supported_problem_types(cls) -> list[str] | None:
         return ["binary", "multiclass", "regression"]
-
-    def _get_default_auxiliary_params(self) -> dict:
-        default_auxiliary_params = super()._get_default_auxiliary_params()
-        default_auxiliary_params.update(
-            {
-                "max_rows": 100_000,
-                "max_features": 2000,
-                "max_classes": 10,
-            }
-        )
-        return default_auxiliary_params
 
     @classmethod
     def _get_default_ag_args_ensemble(cls, **kwargs) -> dict:
@@ -388,3 +431,65 @@ class RealTabPFNv25Model(TabPFNModel):
             "tabpfn-v2.5-regressor-v2.5_small-samples.ckpt",
             "tabpfn-v2.5-regressor-v2.5_variant.ckpt",
         ]
+
+    def _get_default_auxiliary_params(self) -> dict:
+        default_auxiliary_params = super()._get_default_auxiliary_params()
+        default_auxiliary_params.update(
+            {
+                "max_rows": 100_000,
+                "max_features": 2000,
+                "max_classes": 10,
+            }
+        )
+        return default_auxiliary_params
+
+class TabPFNv26Model(TabPFNModel):
+    """TabPFN-2.6 version."""
+
+    ag_key = "TA-TABPFN-2.6"
+    ag_name = "TA-TabPFN-2.6"
+
+    fixed_random_state: int = 0
+    """We found that the validation score is misleading for TabPFN, when one uses a
+    different random state for the refit model than for models fit during CV.
+    This is because TabPFN's random state determines the preprocessing of TabPFN
+    """
+
+    default_classification_model: str | None = "tabpfn-v2.6-classifier-v2.6_default.ckpt"
+    default_regression_model: str | None = "tabpfn-v2.6-regressor-v2.6_default.ckpt"
+
+    @staticmethod
+    def extra_checkpoints_for_tuning(problem_type: str) -> list[str]:
+        """The list of checkpoints to use for hyperparameter tuning."""
+        raise NotImplementedError(
+            "We did not benchmark more checkpoints or tuning."
+        )
+
+    # We do not put a limit on number of classes or features anymore for
+    # the sake of the benchmark.
+    def _get_default_auxiliary_params(self) -> dict:
+        default_auxiliary_params = super()._get_default_auxiliary_params()
+        default_auxiliary_params.update(
+            {
+                "max_rows": 100_000,
+            }
+        )
+        return default_auxiliary_params
+
+    @classmethod
+    def _estimate_memory_usage_static(
+        cls,
+        *,
+        X: pd.DataFrame,
+        hyperparameters: dict | None = None,
+        **kwargs,
+    ) -> int:
+        """Memory estimate for 2.6 and large data is not supported yet.
+        We ignore it for now, moreover as we refit_folds=True, there is no benefit yet.
+
+        """
+        dataset_size_mem_est = (
+            3 * get_approximate_df_mem_usage(X).sum()
+        )
+        baseline_overhead_mem_est = 1e9  # 1 GB generic overhead
+        return dataset_size_mem_est + baseline_overhead_mem_est

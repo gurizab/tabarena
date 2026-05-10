@@ -59,6 +59,10 @@ _methods_paper = [
     "RealTabPFN-v2.5",
     "SAP-RPT-OSS",
     "TabICLv2",
+    "TabSTAR",
+    "PerpetualBooster",
+
+    "TabPFN-v2.6",
 ]
 
 
@@ -119,6 +123,7 @@ class TabArenaContext:
         remove_imputed: bool = False,
         tmp_treat_tasks_independently: bool = False,
         leaderboard_kwargs: dict | None = None,
+        figure_file_type: str = "pdf",
         **kwargs,
     ) -> pd.DataFrame:
         from tabarena.nips2025_utils.compare import compare_on_tabarena
@@ -135,8 +140,41 @@ class TabArenaContext:
             remove_imputed=remove_imputed,
             tmp_treat_tasks_independently=tmp_treat_tasks_independently,
             leaderboard_kwargs=leaderboard_kwargs,
+            figure_file_type=figure_file_type,
             **kwargs,
         )
+
+    def compare_per_dataset(
+        self,
+        output_dir: str | Path,
+        new_results: pd.DataFrame | None = None,
+        ta_results: pd.DataFrame | None = None,
+        **kwargs,
+    ) -> dict[str, pd.DataFrame]:
+        output_dir = Path(output_dir)
+        if ta_results is None:
+            ta_results = self.load_results_paper(
+                download_results="auto",
+            )
+        datasets = sorted(list(ta_results["dataset"].unique()))
+        if new_results is not None:
+            new_datasets = sorted(list(new_results["dataset"].unique()))
+            datasets = sorted(datasets + [d for d in new_datasets if d not in datasets])
+
+        outs = {}
+        plot_tuning_kwargs = kwargs.pop("plot_tuning_kwargs", {})
+        for dataset in datasets:
+            plot_tuning_kwargs_dataset = copy.deepcopy(plot_tuning_kwargs)
+            plot_tuning_kwargs_dataset["title"] = f"Dataset: {dataset}"
+            outs[dataset] = self.compare(
+                output_dir=output_dir / "per_dataset" / dataset,
+                ta_results=ta_results,
+                new_results=new_results,
+                datasets=[dataset],
+                plot_tuning_kwargs=plot_tuning_kwargs_dataset,
+                **kwargs,
+            )
+        return outs
 
     @property
     def methods(self) -> list[str]:
@@ -155,6 +193,22 @@ class TabArenaContext:
             s3_bucket=s3_bucket,
             s3_prefix=s3_prefix,
         )
+
+    def get_method_rename_map(self) -> dict[str, str]:
+        method_rename_map = dict()
+        method_metadatas = self.method_metadata_collection.method_metadata_lst
+        for m in method_metadatas:
+            if m.method_type == "config":
+                display_name = m.display_name
+                if display_name is not None:
+                    if m.config_type in method_rename_map:
+                        print(
+                            f"WARNING: Multiple display_name values detected for the same config_type={m.config_type!r}"
+                            f"\n\tdisplay_name 1: {method_rename_map[m.config_type]!r}"
+                            f"\n\tdisplay_name 2: {display_name!r}"
+                        )
+                    method_rename_map[m.config_type] = display_name
+        return method_rename_map
 
     def load_raw(self, method: str, as_holdout: bool = False) -> list[BaselineResult]:
         metadata: MethodMetadata = self.method_metadata(method=method)
@@ -214,6 +268,7 @@ class TabArenaContext:
         n_iterations: int = 40,
         default_method: str = None,
         always_include_default: bool = True,
+        fixed_configs: list[str] | None = None,
         fit_order: Literal["original", "random"] = "random",
         time_limit: float | None = None,
         backend: Literal["ray", "native"] = "ray",
@@ -223,7 +278,9 @@ class TabArenaContext:
         ta_suite: str = None,
         display_name: str = None,
     ) -> pd.DataFrame:
-        methods: list[MethodMetadata] = [self.method_metadata(m) if isinstance(m, str) else m for m in methods]
+        methods: list[MethodMetadata] = [
+            m if isinstance(m, MethodMetadata) else self.method_metadata(m) for m in methods
+        ]
         if repo is None:
             repo = self.load_repo(methods=methods)
             if folds is not None:
@@ -241,6 +298,7 @@ class TabArenaContext:
             seeds=seeds,
             n_iterations=n_iterations,
             always_include_default=always_include_default,
+            fixed_configs=fixed_configs,
             fit_order=fit_order,
             time_limit=time_limit,
             backend=backend,
@@ -251,6 +309,95 @@ class TabArenaContext:
         hpo_trajectory["ta_name"] = ta_name
         hpo_trajectory["ta_suite"] = ta_suite
         hpo_trajectory["display_name"] = display_name
+        return hpo_trajectory
+
+    # TODO: Refine this
+    def generate_portfolio_trajectories(
+        self,
+        configs: list[str],
+        config_fallback: str | None = None,
+        n_configs: list[int | None] | str = "auto",
+        seeds: int | list[int] = 1,
+        n_iterations: int = 40,
+        fit_order: Literal["original", "random"] = "original",
+        time_limit: float | None = None,
+        methods: str | None = None,
+        repo: EvaluationRepository | None = None,
+        folds: list[int] | None = None,
+        holdout: bool = False,
+        name: str = None,
+        ta_name: str = None,
+        ta_suite: str = None,
+        display_name: str = None,
+        **kwargs,
+    ) -> pd.DataFrame:
+        """
+        Given a list of configs, compute the tuning trajectories
+        for the first N configs for each N in n_configs.
+        """
+        if n_configs == "auto":
+            n_configs = [
+                1,
+                2,
+                5,
+                10,
+                25,
+                50,
+                100,
+                150,
+                None,  # all configs
+            ]
+        if isinstance(seeds, int):
+            seeds = [i for i in range(seeds)]
+
+        if repo is None:
+            if methods is not None:
+                methods: list[MethodMetadata] = [
+                    m if isinstance(m, MethodMetadata) else self.method_metadata(m) for m in methods
+                ]
+            repo = self.load_repo(methods=methods, config_fallback=config_fallback)
+
+        # TODO: also include config_fallback
+        configs_w_fallback = copy.deepcopy(configs)
+        if config_fallback is not None:
+            if config_fallback not in configs_w_fallback:
+                configs_w_fallback.append(config_fallback)
+            repo.set_config_fallback(config_fallback=config_fallback)
+        repo = repo.subset(configs=configs_w_fallback, folds=folds)
+
+        df_results_hpo_lst = []
+
+        n_config_total = len(configs)
+
+        n_configs = [n_config if n_config is not None else n_config_total for n_config in n_configs]
+        n_configs = [n_config for n_config in n_configs if n_config <= n_config_total]
+        n_configs = sorted(list(set(n_configs)))
+
+        for n_config in n_configs:
+            print(f"Running n_config={n_config}")
+            for seed in seeds:
+                df_results_hpo = self.simulate_portfolio_from_configs(
+                    n_iterations=n_iterations,
+                    configs=configs[:n_config],
+                    repo=repo,
+                    folds=folds,
+                    seed=seed,
+                    fit_order=fit_order,
+                    time_limit=time_limit,
+                    **kwargs,
+                )
+
+                if name is not None:
+                    df_results_hpo["method"] = f"HPO-N{n_config}-{name}"
+                df_results_hpo["n_configs"] = n_config
+                df_results_hpo["n_iterations"] = n_iterations
+                df_results_hpo_lst.append(df_results_hpo)
+        hpo_trajectory = pd.concat(df_results_hpo_lst, ignore_index=True)
+
+        hpo_trajectory["ta_name"] = ta_name
+        hpo_trajectory["ta_suite"] = ta_suite
+        hpo_trajectory["display_name"] = display_name
+
         return hpo_trajectory
 
     def combine_hpo(
@@ -635,6 +782,7 @@ class TabArenaContext:
         use_latex: bool = False,
         fillna_method: str | None = "RF (default)",  # FIXME: Don't hardcode
         use_website_folder_names: bool = False,
+        evaluator_kwargs: dict = None,
     ):
         if df_results is None:
             df_results = self.load_results_paper(download_results="auto")
@@ -654,6 +802,19 @@ class TabArenaContext:
             elo_bootstrap_rounds=elo_bootstrap_rounds,
             use_latex=use_latex,
             use_website_folder_names=use_website_folder_names,
+            evaluator_kwargs=evaluator_kwargs,
+        )
+
+    def plot_tuning_trajectories_per_dataset(
+        self,
+        save_path: str | Path,
+        **kwargs,
+    ):
+        from tabarena.plot.tuning_trajectories.plot_pareto_over_tuning_time import plot_tuning_trajectories_per_dataset
+        plot_tuning_trajectories_per_dataset(
+            tabarena_context=self,
+            fig_save_dir=save_path,
+            **kwargs,
         )
 
     def plot_runtime_per_method(self, save_path: str | Path, df_results_configs: pd.DataFrame = None):

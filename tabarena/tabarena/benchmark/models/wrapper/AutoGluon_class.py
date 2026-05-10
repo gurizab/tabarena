@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import inspect
 import shutil
 from typing import Type
 
@@ -10,6 +11,7 @@ import pandas as pd
 
 from tabarena.benchmark.models.wrapper.abstract_class import AbstractExecModel, _apply_inv_perm, _make_perm
 
+from loguru import logger
 
 class AGWrapper(AbstractExecModel):
     can_get_error_val = True
@@ -21,32 +23,117 @@ class AGWrapper(AbstractExecModel):
         fit_kwargs: dict | None = None,
         preprocess_data: bool = False,
         preprocess_label: bool = False,
+        target_name: str | None = None,
+        persist: bool = False,
         **kwargs,
     ):
-        super().__init__(preprocess_data=preprocess_data, preprocess_label=preprocess_label, **kwargs)
+        super().__init__(preprocess_data=preprocess_data, preprocess_label=preprocess_label, target_name=target_name, **kwargs)
         if init_kwargs is None:
             init_kwargs = {}
         if fit_kwargs is None:
             fit_kwargs = {}
         self.init_kwargs = init_kwargs
         self.fit_kwargs = fit_kwargs
-        self.label = "__label__"
+        if target_name is None:
+            target_name = "__label__"
+        self.label = target_name
+        self.persist = persist
 
-    def _fit(self, X: pd.DataFrame, y: pd.Series, X_val: pd.DataFrame = None, y_val: pd.Series = None, **kwargs):
-        from autogluon.tabular import TabularPredictor
+    def _resolve_validation_protocol(
+        self,
+        *,
+        X: pd.DataFrame,
+        y: pd.Series,
+        X_val: pd.DataFrame | None,
+        y_val: pd.Series | None,
+    ) -> tuple[pd.DataFrame, dict, dict]:
+        """Update the AutoGluon validation protocol."""
+        init_kwargs = copy.deepcopy(self.init_kwargs)
+        fit_kwargs = copy.deepcopy(self.fit_kwargs)
 
-        train_data = X.copy()
+        num_folds = fit_kwargs.pop("num_bag_folds", None)
+        num_repeats = fit_kwargs.pop("num_bag_folds", None)
+
+        custom_splits, num_folds, num_repeats = self.resolve_validation_splits(
+            X=X.reset_index(drop=True),
+            y=y.reset_index(drop=True),
+            num_folds=num_folds,
+            num_repeats=num_repeats
+        )
+
+        if num_folds is not None:
+            logger.info(f"Using num_folds: {num_folds}")
+            fit_kwargs["num_bag_folds"] = num_folds
+        if num_repeats is not None:
+            logger.info(f"Using num_repeats: {num_repeats}")
+            fit_kwargs["num_bag_sets"] = num_repeats
+        if custom_splits is not None:
+            logger.info("Using custom_splits for validation protocol.")
+            if "ag_args_ensemble" not in fit_kwargs:
+                fit_kwargs["ag_args_ensemble"] = {}
+            fit_kwargs["ag_args_ensemble"]["custom_splits"] = custom_splits
+
+        feature_generator_cls = fit_kwargs.pop("feature_generator_cls", None)
+        if feature_generator_cls is not None:
+            feature_generator_kwargs = fit_kwargs.pop("feature_generator_kwargs", {})
+            sig = inspect.signature(feature_generator_cls.__init__)
+            group_params = {
+                "group_cols": self.group_on,
+                "group_labels": self.group_labels,
+                "group_time_on": self.group_time_on,
+            }
+            for param, value in group_params.items():
+                if param in sig.parameters:
+                    feature_generator_kwargs[param] = value
+            fit_kwargs["feature_generator"] = feature_generator_cls(**feature_generator_kwargs)
+
+        # TODO: think about if we can reset the index here without breaking simulation artifacts
+        if self._can_use_data_in_place:
+            train_data = X
+            if X_val is not None:
+                tuning_data = X_val
+        else:
+            train_data = X.copy()
+            if X_val is not None:
+                tuning_data = X_val.copy()
+
         train_data[self.label] = y
-
-        fit_kwargs = self.fit_kwargs.copy()
-
         if X_val is not None:
-            tuning_data = X_val.copy()
             tuning_data[self.label] = y_val
             fit_kwargs["tuning_data"] = tuning_data
 
-        self.predictor = TabularPredictor(label=self.label, problem_type=self.problem_type, eval_metric=self.eval_metric, **self.init_kwargs)
-        self.predictor.fit(train_data=train_data, **fit_kwargs)
+        return train_data, init_kwargs, fit_kwargs
+
+
+    def _fit(
+            self,
+            X: pd.DataFrame,
+            y: pd.Series,
+            X_val: pd.DataFrame = None,
+            y_val: pd.Series = None,
+            **kwargs
+    ):
+        from autogluon.tabular import TabularPredictor
+
+        # FIXME: should we not reset the index of train data here?
+        train_data, init_kwargs, fit_kwargs = self._resolve_validation_protocol(
+            X=X,
+            y=y,
+            X_val=X_val,
+            y_val=y_val,
+        )
+
+        self.predictor = TabularPredictor(
+            label=self.label,
+            problem_type=self.problem_type,
+            eval_metric=self.eval_metric,
+            **init_kwargs
+        )
+        self.predictor.fit(
+            train_data=train_data,
+            **fit_kwargs
+        )
+
         # FIXME: persist
         return self
 
@@ -57,6 +144,14 @@ class AGWrapper(AbstractExecModel):
     def _predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
         y_pred_proba = self.predictor.predict_proba(X)
         return y_pred_proba
+
+    def pre_predict(self):
+        if self.persist:
+            self.predictor.persist(models="best", max_memory=None)
+
+    def post_predict(self):
+        if self.persist:
+            self.predictor.unpersist()
 
     def get_oof(self):
         # TODO: Rename method

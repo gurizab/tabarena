@@ -251,9 +251,8 @@ class EndToEndSingle:
             method_metadata.cache_raw(results_lst=results_lst)
 
         if task_metadata is None:
-            log(f"\tFetching task_metadata from OpenML...")
             tids = list({r.task_metadata["tid"] for r in results_lst})
-            task_metadata = generate_task_metadata(tids=tids)
+            task_metadata = cls.fetch_task_metadata(tids=tids, verbose=verbose)
 
         log(f"\tConverting raw results into an EvaluationRepository...")
         # processed
@@ -315,6 +314,7 @@ class EndToEndSingle:
         model_key: str | None = None,
         method: str | None = None,
         artifact_name: str | None = None,
+        name_prefix_raw: str | None = None,
         backend: Literal["ray", "native"] = "ray",
         verbose: bool = True,
     ) -> Self:
@@ -343,7 +343,7 @@ class EndToEndSingle:
 
         """
         engine = "ray" if backend == "ray" else "sequential"
-        results_lst: list[BaselineResult] = load_raw(path_raw=path_raw, engine=engine)
+        results_lst: list[BaselineResult] = load_raw(path_raw=path_raw, engine=engine, name_pattern=name_prefix_raw)
         return cls.from_raw(
             results_lst=results_lst,
             method_metadata=method_metadata,
@@ -410,6 +410,19 @@ class EndToEndSingle:
         )
 
     @staticmethod
+    def fetch_task_metadata(tids: list[int], verbose: bool = True):
+        log = print if verbose else (lambda *a, **k: None)
+        task_metadata = load_task_metadata()
+        tids_cached = set(task_metadata["tid"].unique())
+
+        tids_missing = [tid for tid in tids if tid not in tids_cached]
+        if tids_missing:
+            log(f"Note: Missing {len(tids_missing)} tasks in the cached task_metadata...")
+            log(f"\tFetching task_metadata from OpenML... (this may take ~1 minute)")
+            task_metadata = generate_task_metadata(tids=tids)
+        return task_metadata
+
+    @staticmethod
     def from_path_raw_to_results(
         path_raw: str | Path | list[str | Path],
         method_metadata: MethodMetadata | None = None,
@@ -423,6 +436,7 @@ class EndToEndSingle:
         artifact_name: str | None = None,
         num_cpus: int | None = None,
         name_prefix_raw: str | None = None,
+        verbose: bool = True,
     ) -> EndToEndResultsSingle:
         """
         Create and cache end-to-end results for the method in the given directory.
@@ -466,14 +480,15 @@ class EndToEndSingle:
             If None, it will use all available CPUs.
         name_prefix_raw: str | None = None
             If specified, we only search for results in subdirectories starting with this prefix.
-            Useful when `path_raw` contains results for multiple methods.
+            Useful when `path_raw` contains results for multiple methods. This should be the
+            `ag_name` of the method's AbstractModel class.
         """
         if num_cpus is None:
             num_cpus = len(os.sched_getaffinity(0))
 
         print("Get results paths...")
         file_paths = fetch_all_pickles(
-            dir_path=path_raw, suffix="results.pkl", name_pattern=name_prefix_raw,
+            dir_path=path_raw, suffix="results.pkl", name_pattern=name_prefix_raw, num_workers=num_cpus,
         )
         if len(file_paths) == 0:
             raise ValueError(f"No results.pkl files found in {path_raw} with name prefix {name_prefix_raw}!")
@@ -486,10 +501,16 @@ class EndToEndSingle:
             all_file_paths_method[did_sid].append(file_path)
 
         if task_metadata is None:
-            print("Get task metadata...")
-            task_metadata = load_task_metadata()
-            # Below is too slow to use by default, TODO: get logic for any task that is fast
-            # task_metadata = generate_task_metadata(tids=list({r.split("/")[0] for r in all_file_paths_method}))
+            tids = list({int(r.split("/")[0]) for r in all_file_paths_method})
+            task_metadata = EndToEndSingle.fetch_task_metadata(tids=tids, verbose=verbose)
+
+        valid_tids = set(task_metadata["tid"].unique())
+        removed = [k for k in all_file_paths_method if int(k.split("/")[0]) not in valid_tids]
+        removed_tids = sorted({int(k.split("/")[0]) for k in removed})
+        for tid in removed_tids:
+            print(f"Removing file paths for task not in task_metadata: tid={tid}")
+        for k in removed:
+            del all_file_paths_method[k]
 
         import ray
         if not ray.is_initialized():

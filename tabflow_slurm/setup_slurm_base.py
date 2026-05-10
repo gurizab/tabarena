@@ -46,7 +46,7 @@ class BenchmarkSetup:
             - slurm_out         -- contains all SLURM output logs
             - .openml-cache     -- contains the OpenML cache
     """
-    python_from_base_path: str = "venvs/tabarena_14022026/bin/python"
+    python_from_base_path: str = "venvs/tabarena_25032026/bin/python"
     """Python executable and environment to use for the SLURM jobs. This should point to a Python
     executable within a (virtual) environment."""
     run_script_from_base_path: str = (
@@ -56,8 +56,8 @@ class BenchmarkSetup:
     for TabArena."""
     openml_cache_from_base_path: str | Literal["auto"] = ".openml-cache"
     """OpenML cache directory. This is used to store dataset and tasks data from OpenML.
-    
-    If "auto", we use the default cache from OpenML. 
+
+    If "auto", we use the default cache from OpenML.
     If any other string, this is interpreted as the path to the folder for a custom OpenML cache.
     """
     slurm_log_output_from_base_path: str = "slurm_out/"
@@ -138,6 +138,11 @@ class BenchmarkSetup:
     """
     time_limit: int = 3600
     """Time limit for each fit (all 8 folds) of a model in seconds. By default, 3600 seconds is used."""
+    time_limit_with_preprocessing: bool = False
+    """Whether the preprocessing should influence the fit time of the model.
+        If False (default), we stop fitting a model after `time_limit`.
+        If True, we stop fitting a model after `time_limit - time_fore_preprocessing`.
+    """
     time_limit_overhead: int = 1
     """Overhead time in hours to add to the SLURM time limit to account for
     job scheduling and other non-model fitting overhead."""
@@ -190,8 +195,8 @@ class BenchmarkSetup:
     setup_ray_for_slurm_shared_resources_environment: bool = True
     """Prepare Ray for a SLURM shared resource environment. This is used to setup Ray for SLURM
     shared resources. Recommended to set to True if sequential_local_fold_fitting is False."""
-    preprocessing_pieplines: list[str] = field(default_factory=lambda: ["default"])
-    """EXPERIMENTAL, REQUIRES A CUSTOM AUTOGLUON BRANCH!
+    preprocessing_pipelines: list[str] = field(default_factory=lambda: ["default"])
+    """EXPERIMENTAL!
     Preprocessing pipelines to add to the configurations we want to run.
 
     Each options multiplies the number of configurations to run by the number of
@@ -200,7 +205,7 @@ class BenchmarkSetup:
 
     Options:
         - "default": Use the default preprocessing pipeline.
-        - Any other string registered in `tabarena.benchmark.preprocessing.preprocessing_register`.
+        - Any other string points to custom experimental code for now.
     """
     custom_model_constraints: dict[str, dict[str, int]] | None = None
     """Custom mapping of model names to constraints to filter which models runs on
@@ -240,6 +245,10 @@ class BenchmarkSetup:
     By default, we use AutoGluon's automatic preprocessing for all models.
     This can be disabled by setting this to False. Warning: the model then needs
     to be able to handle this!
+    """
+    shuffle_features_per_split: bool = False # TODO: make True by default in the future
+    """If True, we shuffle the features per split before fitting the model.
+        -> Used for TabArena-v0.2.X
     """
 
     # Misc Settings
@@ -554,15 +563,17 @@ class BenchmarkSetup:
             )
         if not self.model_agnostic_preprocessing:
             method_kwargs["fit_kwargs"] = {"feature_generator": None}
+        if self.shuffle_features_per_split:
+            method_kwargs["shuffle_features"] = self.shuffle_features_per_split
 
         print(
             "Generating experiments for models...",
             f"\n\t`all` := number of configs: {self.n_random_configs}",
             f"\n\t{len(self.models)} models: {self.models}",
-            f"\n\t{len(self.preprocessing_pieplines)} preprocessing pipelines: {self.preprocessing_pieplines}",
+            f"\n\t{len(self.preprocessing_pipelines)} preprocessing pipelines: {self.preprocessing_pipelines}",
             f"\n\tMethod kwargs: {method_kwargs}",
         )
-        for preprocessing_name in self.preprocessing_pieplines:
+        for preprocessing_name in self.preprocessing_pipelines:
             pipeline_method_kwargs = deepcopy(method_kwargs)
 
             name_id_suffix = ""
@@ -612,6 +623,7 @@ class BenchmarkSetup:
                         name_id_suffix=name_id_suffix,
                         method_kwargs=pipeline_method_kwargs,
                         time_limit=self.time_limit,
+                        time_limit_with_preprocessing=self.time_limit_with_preprocessing,
                     )
                 )
 

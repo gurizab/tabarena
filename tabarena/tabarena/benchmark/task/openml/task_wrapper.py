@@ -13,16 +13,29 @@ from autogluon.common.savers import save_pd, save_json
 from autogluon.core.utils import generate_train_test_split
 
 from .task_utils import get_task_data, get_ag_problem_type, get_task_with_retry
+from ..utils import get_split_idx, get_split_vals_from_split_idx
 from ....utils.s3_utils import download_task_from_s3, upload_task_to_s3
 
 logger = logging.getLogger(__name__)
 
 
 class OpenMLTaskWrapper:
-    def __init__(self, task: OpenMLSupervisedTask, *, use_task_eval_metric: bool = False):
+    def __init__(self, task: OpenMLSupervisedTask, *, use_task_eval_metric: bool = False, lazy_load_data: bool = False):
         assert isinstance(task, OpenMLSupervisedTask)
         self.task: OpenMLSupervisedTask = task
+        self.lazy_load_data = lazy_load_data
         self.X, self.y = get_task_data(task=self.task)
+        self._n_rows, self._n_cols = self.X.shape
+
+        # Light metadata for task handling.
+        self._has_datetime = len(self.X.select_dtypes(include=["datetime64"]).columns) > 0
+        self._has_text = len(self.X.select_dtypes(include=["string"]).columns) > 0
+        self._has_categorical = len(self.X.select_dtypes(include=["category"]).columns) > 0
+        self._has_numeric = len(self.X.select_dtypes(include=["number"]).columns) > 0
+
+        if self.lazy_load_data:
+            del self.X, self.y
+
         self.problem_type = get_ag_problem_type(self.task)
         self.label = self.task.target_name
 
@@ -59,12 +72,22 @@ class OpenMLTaskWrapper:
         }
         return metric_map[self.problem_type]
 
+    def compute_error(self, y_true, y_pred) -> float:
+        eval_metric = self.eval_metric
+        from autogluon.core.metrics import get_metric
+        scorer = get_metric(metric=eval_metric, problem_type=self.problem_type)
+        return scorer.error(y_true, y_pred)
+
     def get_split_dimensions(self) -> tuple[int, int, int]:
         n_repeats, n_folds, n_samples = self.task.get_split_dimensions()
         return n_repeats, n_folds, n_samples
 
     def combine_X_y(self) -> pd.DataFrame:
-        return pd.concat([self.X, self.y.to_frame(name=self.label)], axis=1)
+        if self.lazy_load_data:
+            X, y = get_task_data(task=self.task)
+        else:
+            X, y = self.X, self.y
+        return pd.concat([X, y.to_frame(name=self.label)], axis=1)
 
     def save_data(self, path: str, file_type='.csv', train_indices=None, test_indices=None):
         data = self.combine_X_y()
@@ -80,8 +103,8 @@ class OpenMLTaskWrapper:
         metadata = dict(
             label=self.label,
             problem_type=self.problem_type,
-            num_rows=len(self.X),
-            num_cols=len(self.X.columns),
+            num_rows=self._n_rows,
+            num_cols=self._n_cols,
             task_id=self.task.task_id,
             dataset_id=self.task.dataset_id,
             openml_url=self.task.openml_url,
@@ -95,24 +118,23 @@ class OpenMLTaskWrapper:
 
     def get_split_idx(self, fold: int = 0, repeat: int = 0, sample: int = 0) -> int:
         n_repeats, n_folds, n_samples = self.get_split_dimensions()
-        assert fold < n_folds
-        assert repeat < n_repeats
-        assert sample < n_samples
-        split_idx = n_folds * n_samples * repeat + n_samples * fold + sample
-        return split_idx
+        return get_split_idx(
+            fold=fold,
+            repeat=repeat,
+            sample=sample,
+            n_folds=n_folds,
+            n_repeats=n_repeats,
+            n_samples=n_samples,
+        )
 
-    def split_vals_from_split_idx(self, split_idx: int) -> tuple[int, int, int]:
+    def get_split_vals_from_split_idx(self, split_idx: int) -> tuple[int, int, int]:
         n_repeats, n_folds, n_samples = self.get_split_dimensions()
-
-        repeat = math.floor(split_idx / (n_folds * n_samples))
-        remainder = split_idx % (n_folds * n_samples)
-        fold = math.floor(remainder / n_samples)
-        sample = remainder % n_samples
-
-        assert fold < n_folds
-        assert repeat < n_repeats
-        assert sample < n_samples
-        return repeat, fold, sample
+        return get_split_vals_from_split_idx(
+            split_idx=split_idx,
+            n_folds=n_folds,
+            n_repeats=n_repeats,
+            n_samples=n_samples,
+        )
 
     def get_train_test_split(
         self,
@@ -127,10 +149,20 @@ class OpenMLTaskWrapper:
     ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
         if train_indices is None or test_indices is None:
             train_indices, test_indices = self.get_split_indices(fold=fold, repeat=repeat, sample=sample)
-        X_train = self.X.loc[train_indices]
-        y_train = self.y[train_indices]
-        X_test = self.X.loc[test_indices]
-        y_test = self.y[test_indices]
+
+        if self.lazy_load_data:
+            X, y = get_task_data(task=self.task)
+            X_train = X.loc[train_indices].copy()
+            y_train = y[train_indices].copy()
+            X_test = X.loc[test_indices].copy()
+            y_test = y[test_indices].copy()
+            del X, y
+        else:
+            X, y = self.X, self.y
+            X_train = X.loc[train_indices]
+            y_train = y[train_indices]
+            X_test = X.loc[test_indices]
+            y_test = y[test_indices]
 
         if train_size is not None:
             X_train, y_train = self.subsample(X=X_train, y=y_train, size=train_size, random_state=random_state)
@@ -201,6 +233,49 @@ class OpenMLTaskWrapper:
     ) -> pd.DataFrame:
         data, _ = self.subsample(X=data, y=data[self.label], size=size, random_state=random_state)
         return data
+
+    def get_validation_split_kwargs(self) -> dict:
+        """Extra splits kwargs from the TabArenaOpenMLSupervisedTask task,
+        or fallback to defaults.
+        """
+        from openml.tasks import OpenMLSupervisedTask
+
+        from tabarena.benchmark.task.user_task import TabArenaOpenMLSupervisedTask
+
+        oml_task: TabArenaOpenMLSupervisedTask | OpenMLSupervisedTask  = self.task
+
+        if isinstance(oml_task, TabArenaOpenMLSupervisedTask):
+            stratify_on = oml_task.stratify_on
+            group_on = oml_task.group_on
+            time_on = oml_task.time_on
+            group_time_on = oml_task.group_time_on
+            group_labels = oml_task.group_labels
+            split_time_horizon = oml_task.split_time_horizon
+            split_time_horizon_unit = oml_task.split_time_horizon_unit
+        else:
+            (
+                stratify_on,
+                group_on,
+                time_on,
+                group_time_on,
+                group_labels,
+                split_time_horizon,
+                split_time_horizon_unit
+            )= None, None, None, None, None, None, None
+
+
+
+        return dict(  # noqa: C408
+            target_name=oml_task.target_name,
+            stratify_on=stratify_on,
+            group_on=group_on,
+            time_on=time_on,
+            group_time_on=group_time_on,
+            group_labels=group_labels,
+            split_time_horizon=split_time_horizon,
+            split_time_horizon_unit=split_time_horizon_unit,
+        )
+
 
 
 class OpenMLS3TaskWrapper(OpenMLTaskWrapper):

@@ -12,9 +12,11 @@ from tabarena.paper.tabarena_evaluator import TabArenaEvaluator
 def compare_on_tabarena(
     output_dir: str | Path,
     new_results: pd.DataFrame | None = None,
+    ta_results: pd.DataFrame | None = None,
     *,
     only_valid_tasks: bool | str | list[str] = False,
     subset: str | list[str] | None = None,
+    datasets: list[str] | None = None,
     folds: list[int] | None = None,
     tabarena_context: TabArenaContext | None = None,
     tabarena_context_kwargs: dict | None = None,
@@ -35,33 +37,22 @@ def compare_on_tabarena(
 
     # TODO: only methods that exist in runs
     #  Pair with (method, artifact_name)
-    method_rename_map = dict()
-    method_metadatas = tabarena_context.method_metadata_collection.method_metadata_lst
-    for m in method_metadatas:
-        if m.method_type == "config":
-            display_name = m.display_name
-            if display_name is not None:
-                if m.config_type in method_rename_map:
-                    print(
-                        f"WARNING: Multiple display_name values detected for the same config_type={m.config_type!r}"
-                        f"\n\tdisplay_name 1: {method_rename_map[m.config_type]!r}"
-                        f"\n\tdisplay_name 2: {display_name!r}"
-                    )
-                method_rename_map[m.config_type] = display_name
+    method_rename_map = tabarena_context.get_method_rename_map()
 
-    paper_results = tabarena_context.load_results_paper(
-        download_results="auto",
-    )
+    if ta_results is None:
+        ta_results = tabarena_context.load_results_paper(
+            download_results="auto",
+        )
 
     if new_results is not None:
         new_results = new_results.copy(deep=True)
-        if "method_subtype" not in new_results:
+        if "method_subtype" not in new_results.columns:
             new_results["method_subtype"] = np.nan
 
     if new_results is not None:
-        df_results = pd.concat([paper_results, new_results], ignore_index=True)
+        df_results = pd.concat([ta_results, new_results], ignore_index=True)
     else:
-        df_results = paper_results
+        df_results = ta_results
 
     kwargs = kwargs.copy()
     if isinstance(only_valid_tasks, (str, list)):
@@ -72,12 +63,12 @@ def compare_on_tabarena(
             df_filter=new_results,
         )
 
-    if subset is not None or folds is not None:
+    if subset is not None or folds is not None or datasets is not None:
         if subset is None:
             subset = []
         if isinstance(subset, str):
             subset = [subset]
-        df_results = subset_tasks(df_results=df_results, subset=subset, folds=folds)
+        df_results = subset_tasks(df_results=df_results, subset=subset, folds=folds, datasets=datasets)
 
     return compare(
         df_results=df_results,
@@ -100,6 +91,7 @@ def compare(
     output_dir: str | Path,
     task_metadata: pd.DataFrame = None,
     only_valid_tasks: str | list[str] | None = None,
+    datasets: list[str] | None = None,
     calibration_framework: str | None = None,
     fillna: str | pd.DataFrame | None = None,
     score_on_val: bool = False,
@@ -108,6 +100,7 @@ def compare(
     leaderboard_kwargs: dict | None = None,
     remove_imputed: bool = False,
     method_rename_map: dict | None = None,
+    figure_file_type: str = "pdf",
     **kwargs,
 ):
     df_results = prepare_data(
@@ -116,6 +109,9 @@ def compare(
         fillna=fillna,
         remove_imputed=remove_imputed,
     )
+
+    if datasets is not None:
+        df_results = df_results[df_results["dataset"].isin(datasets)]
 
     if score_on_val:
         error_col = "metric_error_val"
@@ -128,13 +124,13 @@ def compare(
         task_metadata=task_metadata,
         error_col=error_col,
         method_rename_map=method_rename_map,
+        figure_file_type=figure_file_type,
     )
 
     return plotter.eval(
         df_results=df_results,
         plot_extra_barplots=False,
         plot_times=True,
-        plot_other=False,
         calibration_framework=calibration_framework,
         average_seeds=average_seeds,
         tmp_treat_tasks_independently=tmp_treat_tasks_independently,
@@ -208,7 +204,12 @@ def prepare_data(
     return df_results
 
 
-def subset_tasks(df_results: pd.DataFrame, subset: list[str], folds: list[int] = None) -> pd.DataFrame:
+def subset_tasks(
+    df_results: pd.DataFrame,
+    subset: list[str],
+    folds: list[int] = None,
+    datasets: list[str] = None,
+) -> pd.DataFrame:
     from tabarena.nips2025_utils.fetch_metadata import load_task_metadata
 
     df_results = df_results.copy(deep=True)
@@ -275,7 +276,65 @@ def subset_tasks(df_results: pd.DataFrame, subset: list[str], folds: list[int] =
         else:
             raise ValueError(f"Invalid subset {subset} name!")
 
+    if datasets is not None:
+        df_results = df_results[df_results["dataset"].isin(datasets)]
     if folds is not None:
         df_results = df_results[df_results["fold"].isin(folds)]
     df_results = df_results.reset_index(drop=True)
     return df_results
+
+def subset_tasks_new(
+    *,
+    df_results: pd.DataFrame,
+    subset: list[str],
+    task_metadata: pd.DataFrame,
+) -> pd.DataFrame:
+
+    df_results = df_results.copy(deep=True)
+    for filter_subset in subset:
+        if filter_subset == "classification":
+            df_results = df_results[
+                df_results["problem_type"].isin(["binary", "multiclass"])
+            ]
+        elif filter_subset == "binary":
+            df_results = df_results[df_results["problem_type"] == "binary"]
+        elif filter_subset == "multiclass":
+            df_results = df_results[df_results["problem_type"] == "multiclass"]
+        elif filter_subset == "regression":
+            df_results = df_results[df_results["problem_type"] == "regression"]
+        elif filter_subset == "large":
+            task_metadata = task_metadata[task_metadata["n_samples_train_per_fold"] > 100_000]
+            task_metadata = task_metadata[task_metadata["n_samples_train_per_fold"] <= 1_000_000]
+            valid_datasets = task_metadata["dataset"].unique()
+            df_results = df_results[df_results["dataset"].isin(valid_datasets)]
+        elif filter_subset == "medium":
+            task_metadata = task_metadata[task_metadata["n_samples_train_per_fold"] > 10_000]
+            task_metadata = task_metadata[task_metadata["n_samples_train_per_fold"] <= 100_000]
+            valid_datasets = task_metadata["dataset"].unique()
+            df_results = df_results[df_results["dataset"].isin(valid_datasets)]
+        elif filter_subset == "small":
+            task_metadata = task_metadata[task_metadata["n_samples_train_per_fold"] <= 10_000]
+            task_metadata = task_metadata[task_metadata["n_samples_train_per_fold"] > 1_000]
+            valid_datasets = task_metadata["dataset"].unique()
+            df_results = df_results[df_results["dataset"].isin(valid_datasets)]
+        elif filter_subset == "tiny":
+            task_metadata = task_metadata[task_metadata["n_samples_train_per_fold"] > 100]
+            task_metadata = task_metadata[task_metadata["n_samples_train_per_fold"] <= 1_000]
+            valid_datasets = task_metadata["dataset"].unique()
+            df_results = df_results[df_results["dataset"].isin(valid_datasets)]
+        elif filter_subset == "random":
+            task_metadata = task_metadata[task_metadata["time_on"].isna() & task_metadata["group_on"].isna()]
+            valid_datasets = task_metadata["dataset"].unique()
+            df_results = df_results[df_results["dataset"].isin(valid_datasets)]
+        elif filter_subset == "temporal":
+            task_metadata = task_metadata[~task_metadata["time_on"].isna()]
+            valid_datasets = task_metadata["dataset"].unique()
+            df_results = df_results[df_results["dataset"].isin(valid_datasets)]
+        elif filter_subset == "grouped":
+            task_metadata = task_metadata[~task_metadata["group_on"].isna()]
+            valid_datasets = task_metadata["dataset"].unique()
+            df_results = df_results[df_results["dataset"].isin(valid_datasets)]
+        else:
+            raise ValueError(f"Invalid subset {subset} name!")
+
+    return df_results.reset_index(drop=True)
