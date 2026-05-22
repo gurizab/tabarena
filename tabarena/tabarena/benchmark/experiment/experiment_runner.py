@@ -73,7 +73,7 @@ class ExperimentRunner:
             # FIXME: Don't hardcode eval metric
             ag_eval_metric_map = {
                 'binary': 'roc_auc',
-                'multiclass': 'log_loss',
+                'multiclass': 'roc_auc_ovo',
                 'regression': 'rmse',
             }
             self.eval_metric_name = ag_eval_metric_map[self.task.problem_type]
